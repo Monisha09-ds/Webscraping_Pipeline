@@ -1,0 +1,12 @@
+requests
+beautifulsoup4
+markdownify
+faiss-cpu
+chromadb
+
+
+crawl4ai>=0.7.4
+tldextract>=5.1.2
+python-slugify>=8.0.4
+readability-lxml>=0.8.1
+beautifulsoup4>=4.12.3
