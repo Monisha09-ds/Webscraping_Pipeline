@@ -1,0 +1,28 @@
+Webscraping_Pipeline/
+├── src/
+│   ├── main.py                # 🎮 CLI Orchestrator (Entry Point)
+│   ├── scraper/               # 🕷️ Web Scraping Engine
+│   │   ├── recursion.py       #    - Crawl logic (BFS/DFS)
+│   │   ├── frontier.py        #    - URL management
+│   │   └── markdown_saver.py  #    - Content extraction -> .md
+│   ├── vectorstore/           # 🗄️ Vector Database & Embeddings
+│   │   ├── store.py           #    - ChromaDB management
+│   │   ├── embeddings.py      #    - Text embedding logic
+│   │   └── chunker.py         #    - Text splitting/chunking
+│   ├── rag/                   # 🧠 RAG (Retrieval-Augmented Generation)
+│   │   ├── answer.py          #    - Answer generation logic
+│   │   ├── retrieve.py        #    - Context retrieval
+│   │   └── llm.py             #    - LLM Wrappers (Gemini/Local)
+│   ├── pipelines/             # ⛓️ High-level Workflows
+│   │   ├── crawler.py         #    - Crawl pipeline
+│   │   ├── ingest.py          #    - Ingestion pipeline
+│   │   └── query.py           #    - Chat/Query pipeline
+│   ├── api/                   # 🔌 Backend API (FastAPI)
+│   │   ├── routes.py          #    - Main API routes
+│   │   └── chat_api.py        #    - Chat-specific endpoints
+│   ├── frontend/              # 🖥️ User Interface
+│   │   ├── chat_interface.py  #    - Chat UI
+│   │   └── scraper_interface.py #  - Scraper Control UI
+│   └── utils/                 # 🛠️ Utilities (Config, Logger)
+├── requirements.txt           # 📦 Dependencies
+└── README.md                  # 📖 Documentation (Currently Empty)
