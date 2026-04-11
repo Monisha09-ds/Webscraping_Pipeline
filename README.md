@@ -105,4 +105,3 @@ src/
 - [ ] Visual sitemap generation.
 
 ---
-*Developed as a feature project for professional portfolio presentation.*
