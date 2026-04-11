@@ -158,8 +158,14 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []  # list of {"user": "...", "assistant": "..."}
 
 # --- Helper function to get available scraped folders ---
-def get_scraped_folders(sitecontent_root="/home/aiteam/Desktop/website_content_scrapper/webscraper_pipeline/sitecontent"):
-    sitecontent_path = Path(sitecontent_root)
+def get_scraped_folders():
+    # Detect project root relative to this file (src/frontend/chat_interface.py)
+    PROJ_ROOT = Path(__file__).resolve().parents[2]
+    sitecontent_path = PROJ_ROOT / "sitecontent"
+    
+    if not sitecontent_path.exists():
+        sitecontent_path.mkdir(parents=True, exist_ok=True)
+        
     folders = []
     for item in sitecontent_path.iterdir():
         if item.is_dir() and any(item.rglob("*.md")):
@@ -180,7 +186,8 @@ with st.sidebar:
     selected_folder = st.selectbox("Select Scraped Content Folder", options=[""] + scraped_folders, key="selected_folder")
 
     if selected_folder:
-        folder_path = Path("/home/aiteam/Desktop/website_content_scrapper/webscraper_pipeline/sitecontent") / selected_folder
+        PROJ_ROOT = Path(__file__).resolve().parents[2]
+        folder_path = PROJ_ROOT / "sitecontent" / selected_folder
         st.write(f"Selected Folder: {folder_path}")
 
         # Check if embeddings exist and set session_id
@@ -221,9 +228,13 @@ with st.sidebar:
                 "Select Model Type", ["local", "api"], key="init_model_type"
             )
             init_model_name = None
+            init_api_key = None
             if init_model_type == "api":
                 init_model_name = st.text_input(
                     "Gemini model", value="gemini-1.5-flash", key="init_model_name"
+                )
+                init_api_key = st.text_input(
+                    "Optional: Gemini API Key", type="password", help="Leave blank to use server-side key", key="init_api_key"
                 )
 
             if st.button("Initialize Chat", key="btn_chat_init"):
@@ -232,6 +243,7 @@ with st.sidebar:
                         "session_id": st.session_state.session_id,
                         "model_type": init_model_type,
                         "model_name": init_model_name,
+                        "api_key": init_api_key if init_api_key else None
                     }
                     resp = requests.post(f"{BACKEND_URL}/chat/init", json=payload)
                     resp.raise_for_status()
@@ -283,39 +295,55 @@ with st.sidebar:
 
 # Main: Chat Interface
 st.header("Chat Interface")
+
 if not st.session_state.session_id:
     st.warning("Create a session by scraping a site first.")
 elif not st.session_state.chat_initialized:
     st.info("Initialize chat in the sidebar to start chatting.")
 else:
-    # Display conversation history (simple)
-    if st.session_state.chat_history:
-        st.write("### Conversation")
-        for i, turn in enumerate(st.session_state.chat_history, 1):
-            st.markdown(f"**You {i}:** {turn['user']}")
-            st.markdown(f"**Assistant {i}:** {turn['assistant']}")
+    # --- Display Sidebar Stats ---
+    with st.sidebar:
+        st.divider()
+        st.subheader("📊 Session Stats")
+        st.write(f"**Session ID:** `{st.session_state.session_id}`")
+        st.write(f"**Messages:** {len(st.session_state.chat_history)}")
+        if st.button("Reset Chat History"):
+            st.session_state.chat_history = []
+            st.rerun()
 
-    # Input & send
-    user_msg = st.text_input("Enter your message", key="chat_msg_input")
-    if st.button("Send", key="btn_chat_send"):
-        if not user_msg.strip():
-            st.warning("Type a message first.")
-        else:
-            try:
+    # --- Display Chat History ---
+    for turn in st.session_state.chat_history:
+        with st.chat_message("user"):
+            st.markdown(turn["user"])
+        with st.chat_message("assistant"):
+            st.markdown(turn["assistant"])
+
+    # --- Chat Input ---
+    if prompt := st.chat_input("Ask something about the scraped content..."):
+        # Add user message to UI immediately
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        try:
+            with st.spinner("Thinking..."):
                 payload = {
                     "session_id": st.session_state.session_id,
-                    "message": user_msg.strip(),
+                    "message": prompt.strip(),
                 }
                 resp = requests.post(f"{BACKEND_URL}/chat", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-                # Update local history so UI stays in sync even if you refresh
-                st.session_state.chat_history.append(
-                    {"user": user_msg.strip(), "assistant": data.get("response", "")}
-                )
-                # Clear the input field after the message is sent
-                st.session_state.chat_msg_input = ""
-                st.experimental_rerun()
-            except Exception as e:
-                st.error(f"Chat failed: {e}")
+                response_text = data.get("response", "")
+            
+            # Display assistant response
+            with st.chat_message("assistant"):
+                st.markdown(response_text)
+            
+            # Save to history
+            st.session_state.chat_history.append(
+                {"user": prompt.strip(), "assistant": response_text}
+            )
+            
+        except Exception as e:
+            st.error(f"Chat failed: {e}")
 

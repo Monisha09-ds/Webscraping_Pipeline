@@ -1,0 +1,46 @@
+services:
+  # --- Backend Services ---
+  scraper-api:
+    build: .
+    volumes:
+      - .:/app
+    ports:
+      - "5005:5005"
+    command: python src/api/scraper_endpoints.py
+    environment:
+      - PYTHONHASHSEED=0
+    restart: always
+
+  chat-api:
+    build: .
+    volumes:
+      - .:/app
+    ports:
+      - "5003:5003"
+    command: python src/api/chat_api.py
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    restart: always
+
+  # --- Frontend Services ---
+  scraper-ui:
+    build: .
+    volumes:
+      - .:/app
+    ports:
+      - "8502:8501"
+    command: streamlit run src/frontend/scraper_interface.py --server.port 8501
+    depends_on:
+      - scraper-api
+    restart: always
+
+  chat-ui:
+    build: .
+    volumes:
+      - .:/app
+    ports:
+      - "8501:8501"
+    command: streamlit run src/frontend/chat_interface.py --server.port 8501
+    depends_on:
+      - chat-api
+    restart: always

@@ -46,6 +46,7 @@ class LLMWrapper:
         temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.0")),
         max_retries: int = 3,
         retry_backoff_sec: float = 1.5,
+        api_key: str | None = None,  # Added api_key parameter
     ):
         if mode not in {"local", "api"}:
             raise ValueError("mode must be 'local' or 'api'")
@@ -54,6 +55,7 @@ class LLMWrapper:
         self.temperature = temperature
         self.max_retries = max_retries
         self.retry_backoff_sec = retry_backoff_sec
+        self.api_key = api_key  # Store the api_key
 
         self.model = None
         self.tokenizer = None
@@ -73,11 +75,12 @@ class LLMWrapper:
         if not model_dir.exists():
             raise FileNotFoundError(f"Local model folder not found: {model_dir}")
         if model_dir.name != "gemma-3-4b-it":
-            raise ValueError(f"Expected folder 'gemma-3-4b-it', got '{model_dir.name}'")
+            # Just log a warning instead of raising ValueError to be more flexible
+            logger.warning(f"Expected folder 'gemma-3-4b-it', got '{model_dir.name}'")
 
         # # self.device = "cuda" if torch.cuda.is_available() else "cpu"
         # self.device = "cpu"  # Force CPU usage for LLM
-        self.device = "cuda"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu" # Auto-detect
         logger.info(f"[LLM] Local mode on device: {self.device}")
         logger.info(f"[LLM] Loading local model: {model_dir}")
 
@@ -88,22 +91,20 @@ class LLMWrapper:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        dtype = torch.float16 
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-        # dtype = torch.float16 if self.device == "cuda" else torch.float16
         self.model = AutoModelForCausalLM.from_pretrained(
             model_dir, local_files_only=True, trust_remote_code=True, torch_dtype=dtype
         ).to(self.device).eval()
         logger.info("[LLM] Local model loaded ✅")
 
     def _init_api(self):
-        # Prefer GOOGLE_API_KEY; warn if both are set
-        if GOOGLE_API_KEY and GEMINI_API_KEY:
-            logger.warning("Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.")
-        api_key = GOOGLE_API_KEY or GEMINI_API_KEY
+        # Prefer the explictly passed api_key, then GOOGLE_API_KEY, then GEMINI_API_KEY
+        api_key = self.api_key or GOOGLE_API_KEY or GEMINI_API_KEY
+        
         if not api_key:
             raise EnvironmentError(
-                "Missing GOOGLE_API_KEY (or GEMINI_API_KEY). Set it in your environment or .env for API mode."
+                "Missing GOOGLE_API_KEY. Provide it in the UI, environment, or .env file."
             )
         # Some client versions auto-read env; we pass explicitly for clarity
         self.client = genai.Client(api_key=api_key)

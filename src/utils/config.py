@@ -69,18 +69,20 @@ STRICT_CRAWL4AI_ONLY = True
 WRITE_REDIRECT_STUB = True
 
 
-PROJ_ROOT = Path(__file__).resolve().parents[3]      # website_content_scrapper
-APP_ROOT  = PROJ_ROOT / "webscraper_pipeline"        # webscraper_pipeline
+APP_ROOT  = PROJECT_ROOT        # Corrected to use PROJECT_ROOT
 SRC_ROOT  = APP_ROOT / "src"
 
 SITECONTENT_ROOT = APP_ROOT / "sitecontent"          # crawled markdown
 OUTPUT_ROOT      = APP_ROOT / "output"               # app outputs
 CHROMA_ROOT      = APP_ROOT / "chroma_store"         # chroma persistence
 
+# --- Flag for using local vs downloadable embeddings ---
+USE_LOCAL_EMBEDDINGS = False # Default to False for portfolio portability
+
 # --- Collection name (use everywhere!) ---
 COLLECTION_NAME = "rag_docs"
 
-# --- Local models ---
+# --- Local models (Optional) ---
 MODELS_ROOT      = APP_ROOT / "models"
 EMBED_MODEL_PATH = str(MODELS_ROOT / "colnomic-embed-multimodal-3b")
 LLM_MODEL_PATH   = str(MODELS_ROOT / "gemma-3-4b-it")

@@ -66,6 +66,7 @@ class ChatInitRequest(BaseModel):
     session_id: str
     model_type: str = "api"
     model_name: str | None = None
+    api_key: str | None = None  # Added api_key
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -163,7 +164,7 @@ async def chat_init(request: ChatInitRequest):
     try:
         # Create objects once and cache them in the session
         model_name = request.model_name or "gemini-1.5-flash"
-        llm = LLMWrapper(mode=request.model_type, model_name=model_name)
+        llm = LLMWrapper(mode=request.model_type, model_name=model_name, api_key=request.api_key)
 
         # Vector store + embedder (reload from collection)
         store = ChromaStore(persist_dir=CHROMA_ROOT)

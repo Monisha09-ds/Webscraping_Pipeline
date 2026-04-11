@@ -13,8 +13,7 @@ PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 
-from utils.config import EMBED_MODEL_PATH  
-
+from utils.config import EMBED_MODEL_PATH, USE_LOCAL_EMBEDDINGS
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -24,44 +23,65 @@ logging.info(f"[Embeddings] Torch {torch.__version__}, Transformers {transformer
 class LocalTextEmbedder:
     """
     Local CPU/GPU-based text embedder for scraped markdown content.
-    Loads HuggingFace model from local folder and generates embeddings via mean pooling.
+    Loads HuggingFace model from local folder OR downloads from HF if missing.
     """
 
-    def __init__(self, model_path: Optional[str] = None, device: str = None, torch_dtype=torch.float16):
-        self.model_path = Path(model_path or EMBED_MODEL_PATH).resolve()
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"Local embedding model not found at {self.model_path}")
+    def __init__(self, model_path: Optional[str] = None, device: str = None, torch_dtype=None):
+        # Default to a lightweight portable model if not found locally
+        DEFAULT_PORTABLE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+        
+        raw_path = model_path or EMBED_MODEL_PATH
+        self.model_path_or_name = raw_path
+        
+        # Check if it's a local directory
+        self.is_local = Path(raw_path).exists() and Path(raw_path).is_dir()
+        
+        if not self.is_local:
+            if USE_LOCAL_EMBEDDINGS:
+                raise FileNotFoundError(f"Local embedding model not found at {raw_path} and USE_LOCAL_EMBEDDINGS is True")
+            else:
+                logging.info(f"[Embeddings] Local path {raw_path} not found. Falling back to downloadable model: {DEFAULT_PORTABLE_MODEL}")
+                self.model_path_or_name = DEFAULT_PORTABLE_MODEL
 
-        # # Auto-detect device if not provided
-        # if device is None:
-        #     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        device = "cpu"  # Force CPU usage for embeddings
-
+        # Auto-detect device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        
         self.device = device
-        self.torch_dtype = torch_dtype
+        # Use float32 on CPU for better compatibility, float16 on GPU
+        self.torch_dtype = torch_dtype or (torch.float16 if self.device == "cuda" else torch.float32)
+        
         self.model = None
         self.tokenizer = None
 
-        logging.info(f"[Embeddings] Using local model at: {self.model_path} on {self.device}")
+        logging.info(f"[Embeddings] Using model: {self.model_path_or_name} on {self.device}")
         self._load_model()
 
     def _load_model(self):
-        """Load HuggingFace model from local folder."""
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path,
-            local_files_only=True,
-            trust_remote_code=True,
-        )
+        """Load HuggingFace model."""
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path_or_name,
+                local_files_only=self.is_local,
+                trust_remote_code=True,
+            )
 
-        
-        self.model = AutoModel.from_pretrained(
-            self.model_path,
-            local_files_only=True,
-            trust_remote_code=True,
-            torch_dtype=self.torch_dtype,
-            
-        )
+            self.model = AutoModel.from_pretrained(
+                self.model_path_or_name,
+                local_files_only=self.is_local,
+                trust_remote_code=True,
+                torch_dtype=self.torch_dtype,
+            )
+        except Exception as e:
+            logging.error(f"[Embeddings] Failed to load model {self.model_path_or_name}: {e}")
+            # Final fallback to standard MiniLM if anything fails
+            if self.model_path_or_name != "sentence-transformers/all-MiniLM-L6-v2":
+                logging.info("[Embeddings] Attempting final fallback to sentence-transformers/all-MiniLM-L6-v2")
+                self.model_path_or_name = "sentence-transformers/all-MiniLM-L6-v2"
+                self.is_local = False
+                self._load_model()
+                return
+            raise e
 
         self.model.to(self.device)
         self.model.eval()
