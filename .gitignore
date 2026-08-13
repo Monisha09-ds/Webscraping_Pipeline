@@ -100,6 +100,9 @@ chroma/
 frontier(bfs).py
 output/
 sessions/
+build.log
+*.log
+.cache/
 
 # IDE-specific
 .vscode/

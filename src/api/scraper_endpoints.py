@@ -1,54 +1,72 @@
-# backend.py - FastAPI backend for the web scraper (SCRAPER-ONLY)
+# src/api/scraper_endpoints.py - FastAPI service for the recursive crawler.
 
 from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uuid
-from pathlib import Path
-import logging
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import glob
-import sys
+from pydantic import BaseModel, field_validator
 
-PROJ_ROOT = Path(__file__).resolve().parents[2]      # -> .../webscraper_pipeline
+PROJ_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = PROJ_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from utils.config import (
+    CORS_ORIGINS,
+    CRAWL_STRATEGY_DEFAULT,
+    SCRAPER_API_PORT,
+    SITECONTENT_ROOT,
+    collection_for_session,
+)
 from utils.logger import get_logger
-from utils.config import SITECONTENT_ROOT, CHROMA_ROOT  # single source of truth
+from utils.session import save_session, session_id_for_folder
 from scraper.recursion import recursive_crawl
 
-app = FastAPI()
-logger = get_logger("scraper-backend")
+logger = get_logger("scraper-api")
 logging.basicConfig(level=logging.INFO)
 
+app = FastAPI(title="Webscraper RAG - Scraper API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------- In-memory session storage ----------------
-# session_id -> {"folder": Path, "collection_name": str}
-sessions: dict[str, dict] = {}
 
 class ScrapeRequest(BaseModel):
     url: str
-    strategy: str = "bfs"           # or "dfs"
+    strategy: str = CRAWL_STRATEGY_DEFAULT
     max_depth: int = 2
     max_pages_per_url: int = 5
     max_total_nodes: int = 100
     max_total_pages: int = 200
     same_domain_only: bool = True
 
-class IngestRequest(BaseModel):
-    session_id: str  # (kept if you later add /ingest in this service)
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        parsed = urlparse(v.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("url must be an absolute http(s) URL, e.g. https://example.com")
+        return v.strip()
+
+    @field_validator("strategy")
+    @classmethod
+    def _validate_strategy(cls, v: str) -> str:
+        if v not in {"bfs", "dfs"}:
+            raise ValueError("strategy must be 'bfs' or 'dfs'")
+        return v
+
 
 def _run_crawler_sync(
     url: str,
@@ -59,9 +77,6 @@ def _run_crawler_sync(
     max_total_pages: int,
     same_domain_only: bool,
 ) -> int:
-    """
-    Synchronous wrapper around the recursive crawler.
-    """
     count = recursive_crawl(
         start_url=url,
         strategy=strategy,
@@ -71,30 +86,36 @@ def _run_crawler_sync(
         max_total_nodes=max_total_nodes,
         same_domain_only=same_domain_only,
     )
-    logger.info(f"Crawler done. Total pages saved: {count}")
+    logger.info("Crawler done. Total pages saved: %d", count)
     return count
+
 
 @app.get("/")
 async def read_root():
     return {"message": "Scraper API is alive"}
 
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "sitecontent_root": str(SITECONTENT_ROOT)}
+
+
 @app.post("/scrape")
 async def scrape_endpoint(request: ScrapeRequest):
     """
-    Kick off a crawl and return a new session_id plus the folder where .md files were saved.
-    """
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as pool:
-        try:
-            session_id = str(uuid.uuid4())
-            # Normalize domain to folder name (replace dots with dashes)
-            domain = request.url.split("//")[-1].split("/")[0].replace(".", "-")
-            base_folder = Path(SITECONTENT_ROOT) / domain
-            # Your crawler saves under {domain}/home; keep that convention
-            folder = base_folder / "home"
-            folder.mkdir(parents=True, exist_ok=True)
+    Crawl a site into sitecontent/ and return the folder plus the session id the
+    chat service will use for it.
 
-            # Run crawler off-thread
+    The id is derived from the output folder, so the chat API arrives at the same
+    id independently - no state is shared between the two services.
+    """
+    loop = asyncio.get_running_loop()
+    domain = urlparse(request.url).netloc.replace(".", "-").replace(":", "-")
+    base_folder = Path(SITECONTENT_ROOT) / domain
+    base_folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
             count = await loop.run_in_executor(
                 pool,
                 _run_crawler_sync,
@@ -107,32 +128,41 @@ async def scrape_endpoint(request: ScrapeRequest):
                 request.same_domain_only,
             )
 
-            if count == 0:
-                raise ValueError("No pages were scraped. Check crawler logs for issues.")
+        if count == 0:
+            raise ValueError("No pages were scraped. Check the crawler logs for details.")
 
-            # Find saved files; derive the actual folder saved by the saver
-            saved_files = list(glob.glob(str(base_folder / "**" / "*.md"), recursive=True))
-            logger.info(f"Scraped files saved at: {saved_files}")
-            if not saved_files:
-                raise ValueError("No .md files found after scraping.")
-            actual_folder = Path(saved_files[0]).parent
+        saved_files = sorted(base_folder.rglob("*.md"))
+        if not saved_files:
+            raise ValueError("No .md files found after scraping.")
 
-            collection_name = f"collection_{session_id}"
-            sessions[session_id] = {
-                "folder": actual_folder,
-                "collection_name": collection_name,
-            }
+        # The crawler nests output; ingest the common root so every page is picked up.
+        actual_folder = base_folder
+        logger.info("Scraped %d files under %s", len(saved_files), actual_folder)
 
-            return {
-                "session_id": session_id,
-                "message": "Scraped successfully",
-                "pages_saved": count,
-                "folder": str(actual_folder),
-            }
-        except Exception as e:
-            logger.error(f"Scrape failed: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        session_id = session_id_for_folder(actual_folder)
+        collection = collection_for_session(session_id)
+        save_session(
+            session_id,
+            {"folder": actual_folder, "collection_name": collection, "chat_history": []},
+        )
+
+        return {
+            "session_id": session_id,
+            "message": "Scraped successfully",
+            "pages_saved": count,
+            "files_found": len(saved_files),
+            "folder": str(actual_folder),
+            "collection_name": collection,
+        }
+    except ValueError as e:
+        logger.error("Scrape failed: %s", e)
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Scrape failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5005)
+
+    uvicorn.run(app, host="0.0.0.0", port=SCRAPER_API_PORT)

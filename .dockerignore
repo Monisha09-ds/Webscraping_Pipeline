@@ -1,0 +1,32 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ipynb_checkpoints
+
+# Runtime data - provided by volumes, not baked into the image
+sitecontent/
+chroma_store/
+sessions/
+output/
+models/
+.cache/
+
+# Local secrets (compose injects them via env_file at runtime)
+.env
+
+# Editors
+.vscode/
+.idea/
+
+# Docs / scratch
+*.md
+!README.md
+src/notebooks/
+uv.lock
+*.log
+build.log

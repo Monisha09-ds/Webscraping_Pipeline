@@ -1,257 +1,202 @@
-####-------------####
-# rag/llm.py
-# rag/llm.py
+# src/rag/llm.py
+#
+# Unified LLM interface.
+#   provider="groq"  -> open-source models served by Groq (default)
+#   provider="local" -> a HuggingFace causal LM from a local folder (offline)
+#
+# Failures raise LLMError rather than returning "". An empty string would be
+# indistinguishable from a genuine "I don't know", which makes a dead API key
+# look like a retrieval miss.
+
 from __future__ import annotations
-from pathlib import Path
-import logging
-import os
+
 import gc
+import logging
+import sys
 import time
+from pathlib import Path
+from typing import Optional
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from dotenv import load_dotenv
+PROJ_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJ_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJ_ROOT))
 
-# Google Gemini (google-genai)
-from google import genai
-
-load_dotenv()
+from utils.config import (
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    LLM_MAX_TOKENS,
+    LLM_PROVIDER,
+    LLM_TEMPERATURE,
+    LOCAL_LLM_PATH,
+)
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-ROOT = Path(__file__).resolve()
-DEFAULT_LOCAL_MODEL_DIR = ROOT.parents[2] / "models" / "gemma-3-4b-it"
+# Substrings that mark an error as worth retrying.
+_TRANSIENT_MARKERS = ("429", "500", "502", "503", "504", "timeout", "rate limit", "overloaded")
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # optional legacy env; we prefer GOOGLE_API_KEY
+
+class LLMError(RuntimeError):
+    """Raised when generation fails for an operational reason."""
 
 
 class LLMWrapper:
     """
-    Unified LLM interface:
-      - mode='local' -> loads Gemma-3-4b-it from a local folder
-      - mode='api'   -> calls Gemini via google-genai
-
     Usage:
-        llm = LLMWrapper(mode="api", model_name="gemini-1.5-flash")
-        text = llm.generate(prompt, max_new_tokens=256)
+        llm = LLMWrapper(provider="groq", model_name="llama-3.3-70b-versatile")
+        text = llm.generate(prompt, max_new_tokens=512)
     """
 
     def __init__(
         self,
-        mode: str = os.getenv("LLM_MODE", "api"),
-        model_dir: Path | str = DEFAULT_LOCAL_MODEL_DIR,
-        model_name: str = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash"),
-        temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.0")),
+        provider: Optional[str] = None,
+        model_name: Optional[str] = None,
+        api_key: Optional[str] = None,
+        temperature: float = LLM_TEMPERATURE,
         max_retries: int = 3,
         retry_backoff_sec: float = 1.5,
-        api_key: str | None = None,  # Added api_key parameter
+        model_dir: Path | str | None = None,
+        mode: Optional[str] = None,  # legacy alias for `provider`
     ):
-        if mode not in {"local", "api"}:
-            raise ValueError("mode must be 'local' or 'api'")
-        self.mode = mode
-        self.model_name = model_name
+        resolved = (provider or mode or LLM_PROVIDER or "groq").strip().lower()
+        # Older callers/UIs said "api" when they meant "the hosted provider".
+        if resolved == "api":
+            resolved = "groq"
+        if resolved not in {"groq", "local"}:
+            raise ValueError(f"provider must be 'groq' or 'local', got {resolved!r}")
+
+        self.provider = resolved
+        self.mode = resolved  # backwards-compatible attribute
         self.temperature = temperature
         self.max_retries = max_retries
         self.retry_backoff_sec = retry_backoff_sec
-        self.api_key = api_key  # Store the api_key
 
+        self.client = None
         self.model = None
         self.tokenizer = None
         self.device = "cpu"
-        self.client = None
 
-        if self.mode == "local":
-            self._init_local(model_dir)
+        if self.provider == "groq":
+            self.model_name = (model_name or GROQ_MODEL).strip()
+            self._init_groq(api_key)
         else:
-            self._init_api()
+            self.model_name = model_name or str(model_dir or LOCAL_LLM_PATH)
+            self._init_local(model_dir or LOCAL_LLM_PATH)
 
     # ----------------------------
-    # Initialization helpers
+    # Initialization
     # ----------------------------
-    def _init_local(self, model_dir: Path | str):
+    def _init_groq(self, api_key: Optional[str]) -> None:
+        from groq import Groq
+
+        key = (api_key or GROQ_API_KEY or "").strip()
+        if not key:
+            raise LLMError(
+                "Missing GROQ_API_KEY. Set it in .env, pass it in the UI, or export it "
+                "in the environment. Get a free key at https://console.groq.com/keys"
+            )
+        self.client = Groq(api_key=key)
+        logger.info("[LLM] Groq ready, model=%s", self.model_name)
+
+    def _init_local(self, model_dir: Path | str) -> None:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
         model_dir = Path(model_dir).resolve()
         if not model_dir.exists():
-            raise FileNotFoundError(f"Local model folder not found: {model_dir}")
-        if model_dir.name != "gemma-3-4b-it":
-            # Just log a warning instead of raising ValueError to be more flexible
-            logger.warning(f"Expected folder 'gemma-3-4b-it', got '{model_dir.name}'")
+            raise LLMError(
+                f"Local model folder not found: {model_dir}. "
+                "Either download a model there or use provider='groq'."
+            )
 
-        # # self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # self.device = "cpu"  # Force CPU usage for LLM
-        self.device = "cuda" if torch.cuda.is_available() else "cpu" # Auto-detect
-        logger.info(f"[LLM] Local mode on device: {self.device}")
-        logger.info(f"[LLM] Loading local model: {model_dir}")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("[LLM] Loading local model %s on %s", model_dir, self.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, local_files_only=True, trust_remote_code=True
         )
-        # Ensure pad token exists to avoid warnings/errors in generate()
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         dtype = torch.float16 if self.device == "cuda" else torch.float32
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_dir, local_files_only=True, trust_remote_code=True, torch_dtype=dtype
-        ).to(self.device).eval()
-        logger.info("[LLM] Local model loaded ✅")
-
-    def _init_api(self):
-        # Prefer the explictly passed api_key, then GOOGLE_API_KEY, then GEMINI_API_KEY
-        api_key = self.api_key or GOOGLE_API_KEY or GEMINI_API_KEY
-        
-        if not api_key:
-            raise EnvironmentError(
-                "Missing GOOGLE_API_KEY. Provide it in the UI, environment, or .env file."
+        self.model = (
+            AutoModelForCausalLM.from_pretrained(
+                model_dir, local_files_only=True, trust_remote_code=True, torch_dtype=dtype
             )
-        # Some client versions auto-read env; we pass explicitly for clarity
-        self.client = genai.Client(api_key=api_key)
-        logger.info(f"[LLM] API mode with model: {self.model_name} ✅")
+            .to(self.device)
+            .eval()
+        )
+        logger.info("[LLM] Local model loaded")
 
     # ----------------------------
-    # Public generate
+    # Generation
     # ----------------------------
-    def generate(self, prompt: str, max_new_tokens: int = 256) -> str:
+    def generate(self, prompt: str, max_new_tokens: int = LLM_MAX_TOKENS) -> str:
         if not prompt:
             return ""
+        if self.provider == "groq":
+            return self._groq_generate(prompt, max_new_tokens)
+        return self._local_generate(prompt, max_new_tokens)
 
-        if self.mode == "local":
-            return self._local_generate(prompt, max_new_tokens)
-        else:
-            return self._api_generate(prompt, max_new_tokens)
+    def _groq_generate(self, prompt: str, max_new_tokens: int) -> str:
+        last_error: Optional[Exception] = None
 
-    # ----------------------------
-    # Local path
-    # ----------------------------
-    def _local_generate(self, prompt: str, max_new_tokens: int) -> str:
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=0.0,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        out_ids = outputs[0]
-        input_len = inputs["input_ids"].shape[-1]
-        generated_ids = out_ids[input_len:]
-        return self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-    # # ----------------------------
-    # # API path (version-agnostic)
-    # # ----------------------------
-    # def _api_generate(self, prompt: str, max_new_tokens: int) -> str:
-    #     """
-    #     Works across google-genai versions:
-    #       - new: client.models.generate_content(...)
-    #       - old: client.generate_content(...)device 
-    #     Retries on transient 429/5xx/timeout errors.
-    #     """
-    #     attempt = 0
-    #     while True:
-    #         attempt += 1
-    #         try:
-    #             if hasattr(self.client, "models") and hasattr(self.client.models, "generate_content"):
-    #                 # NEWER clients
-    #                 resp = self.client.models.generate_content(
-    #                     model=self.model_name,
-    #                     contents=prompt,
-    #                     generation_config={
-    #                         "max_output_tokens": max_new_tokens,
-    #                         "temperature": self.temperature,
-    #                     },
-    #                 )
-    #             else:
-    #                 # OLDER clients
-    #                 resp = self.client.generate_content(
-    #                     model=self.model_name,
-    #                     contents=prompt,
-    #                     generation_config={
-    #                         "max_output_tokens": max_new_tokens,
-    #                         "temperature": self.temperature,
-    #                     },
-    #                 )
-    #             text = (getattr(resp, "text", "") or "").strip()
-    #             return text
-    #         except Exception as e:
-    #             msg = str(e)
-    #             transient = any(code in msg for code in ("429", "502", "503", "504", "timeout"))
-    #             if attempt < self.max_retries and transient:
-    #                 sleep_for = self.retry_backoff_sec * attempt
-    #                 logger.warning(
-    #                     f"[LLM] API transient error (attempt {attempt}): {msg} -> retrying in {sleep_for:.1f}s"
-    #                 )
-    #                 time.sleep(sleep_for)
-    #                 continue
-    #             logger.exception("[LLM] API generation failed: %s", e)
-    #             return ""
-
-    def _api_generate(self, prompt: str, max_new_tokens: int) -> str:
-        """
-        Works across google-genai versions:
-        - newer: client.models.generate_content(..., generation_config=...)
-        - older: client.models.generate_content(...)  # no generation_config
-        - much older: client.generate_content(...)
-        Retries on 429/5xx/timeouts.
-        """
-        attempt = 0
-
-        # choose the callable once
-        if hasattr(self.client, "models") and hasattr(self.client.models, "generate_content"):
-            def _call(**kw):  # newer namespace
-                return self.client.models.generate_content(**kw)
-        else:
-            def _call(**kw):  # older flat client
-                return self.client.generate_content(**kw)
-
-        while True:
-            attempt += 1
+        for attempt in range(1, self.max_retries + 1):
             try:
-                payload = {
-                    "model": self.model_name,
-                    "contents": prompt,
-                }
-                gen_cfg = {
-                    "max_output_tokens": max_new_tokens,
-                    "temperature": self.temperature,
-                }
-
-                # Try with generation_config (newer clients)
-                try:
-                    resp = _call(**payload, generation_config=gen_cfg)
-                except TypeError:
-                    # Fallback for older clients (no generation_config kwarg)
-                    resp = _call(**payload)
-
-                text = (getattr(resp, "text", "") or "").strip()
-                return text
-            except Exception as e:
-                msg = str(e)
-                transient = any(code in msg for code in ("429", "502", "503", "504", "timeout"))
-                if attempt < self.max_retries and transient:
-                    sleep_for = self.retry_backoff_sec * attempt
-                    logging.warning(
-                        f"[LLM] API transient error (attempt {attempt}): {msg} -> retrying in {sleep_for:.1f}s"
+                resp = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=self.temperature,
+                    max_tokens=max_new_tokens,
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:  # noqa: BLE001 - re-raised as LLMError below
+                last_error = e
+                msg = str(e).lower()
+                if attempt < self.max_retries and any(m in msg for m in _TRANSIENT_MARKERS):
+                    delay = self.retry_backoff_sec * attempt
+                    logger.warning(
+                        "[LLM] Transient Groq error (attempt %d/%d): %s -> retrying in %.1fs",
+                        attempt, self.max_retries, e, delay,
                     )
-                    time.sleep(sleep_for)
+                    time.sleep(delay)
                     continue
-                logging.exception("[LLM] API generation failed: %s", e)
-                return ""
+                break
+
+        raise LLMError(f"Groq generation failed ({self.model_name}): {last_error}") from last_error
+
+    def _local_generate(self, prompt: str, max_new_tokens: int) -> str:
+        import torch
+
+        try:
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=self.temperature > 0,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            generated = outputs[0][inputs["input_ids"].shape[-1]:]
+            return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+        except Exception as e:
+            raise LLMError(f"Local generation failed: {e}") from e
 
     # ----------------------------
     # Cleanup
     # ----------------------------
-    def cleanup(self):
-        logger.info("[LLM] Cleanup...")
-        if self.mode == "local":
-            for attr in ("model", "tokenizer"):
-                if getattr(self, attr, None) is not None:
-                    delattr(self, attr)
+    def cleanup(self) -> None:
+        logger.info("[LLM] Cleanup")
+        if self.provider == "local":
+            self.model = None
+            self.tokenizer = None
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass

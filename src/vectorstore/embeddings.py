@@ -1,163 +1,136 @@
+# src/vectorstore/embeddings.py
+#
+# Text embedder backed by sentence-transformers.
+#
+# Two things this handles that a raw AutoModel + mean-pool does not:
+#   1. Attention-masked pooling, so padding tokens never leak into a vector.
+#   2. Asymmetric task prefixes (nomic-embed needs "search_document: " on docs
+#      and "search_query: " on queries), applied consistently on both sides.
+
+from __future__ import annotations
+
+import gc
 import logging
+import sys
 from pathlib import Path
 from typing import List, Optional
-import torch
-from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
-import os 
-import sys
-import gc
-from transformers import __version__ as transformers_version
 
-
-PROJ_ROOT = Path(__file__).resolve().parents[1]  
+PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 
-from utils.config import EMBED_MODEL_PATH, USE_LOCAL_EMBEDDINGS
+from utils.config import (
+    EMBED_BATCH_SIZE,
+    EMBED_DEVICE,
+    EMBED_DOC_PREFIX,
+    EMBED_MAX_SEQ_LENGTH,
+    EMBED_MODEL_NAME,
+    EMBED_QUERY_PREFIX,
+    EMBED_TRUST_REMOTE_CODE,
+)
+
+logger = logging.getLogger(__name__)
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logging.info(f"[Embeddings] Torch {torch.__version__}, Transformers {transformers_version}")
+def _resolve_device(device: Optional[str]) -> str:
+    """Turn 'auto'/None into a concrete torch device string."""
+    requested = (device or EMBED_DEVICE or "auto").strip().lower()
+    if requested != "auto":
+        return requested
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
 
 
 class LocalTextEmbedder:
     """
-    Local CPU/GPU-based text embedder for scraped markdown content.
-    Loads HuggingFace model from local folder OR downloads from HF if missing.
+    Embedder for scraped markdown content.
+
+    Accepts either a HuggingFace model id (downloaded and cached on first use)
+    or a path to a local model directory.
     """
 
-    def __init__(self, model_path: Optional[str] = None, device: str = None, torch_dtype=None):
-        # Default to a lightweight portable model if not found locally
-        DEFAULT_PORTABLE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-        
-        raw_path = model_path or EMBED_MODEL_PATH
-        self.model_path_or_name = raw_path
-        
-        # Check if it's a local directory
-        self.is_local = Path(raw_path).exists() and Path(raw_path).is_dir()
-        
-        if not self.is_local:
-            if USE_LOCAL_EMBEDDINGS:
-                raise FileNotFoundError(f"Local embedding model not found at {raw_path} and USE_LOCAL_EMBEDDINGS is True")
-            else:
-                logging.info(f"[Embeddings] Local path {raw_path} not found. Falling back to downloadable model: {DEFAULT_PORTABLE_MODEL}")
-                self.model_path_or_name = DEFAULT_PORTABLE_MODEL
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        device: Optional[str] = None,
+        doc_prefix: Optional[str] = None,
+        query_prefix: Optional[str] = None,
+        batch_size: int = EMBED_BATCH_SIZE,
+    ):
+        from sentence_transformers import SentenceTransformer
 
-        # Auto-detect device
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        self.device = device
-        # Use float32 on CPU for better compatibility, float16 on GPU
-        self.torch_dtype = torch_dtype or (torch.float16 if self.device == "cuda" else torch.float32)
-        
-        self.model = None
-        self.tokenizer = None
+        self.model_name = str(model_path or EMBED_MODEL_NAME)
+        self.device = _resolve_device(device)
+        self.batch_size = batch_size
+        self.doc_prefix = EMBED_DOC_PREFIX if doc_prefix is None else doc_prefix
+        self.query_prefix = EMBED_QUERY_PREFIX if query_prefix is None else query_prefix
 
-        logging.info(f"[Embeddings] Using model: {self.model_path_or_name} on {self.device}")
-        self._load_model()
+        logger.info("[Embeddings] Loading %s on %s", self.model_name, self.device)
+        self.model = SentenceTransformer(
+            self.model_name,
+            device=self.device,
+            trust_remote_code=EMBED_TRUST_REMOTE_CODE,
+        )
 
-    def _load_model(self):
-        """Load HuggingFace model."""
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path_or_name,
-                local_files_only=self.is_local,
-                trust_remote_code=True,
+        # Cap the window: scraped pages are long and the default can blow up RAM.
+        if EMBED_MAX_SEQ_LENGTH:
+            self.model.max_seq_length = min(
+                EMBED_MAX_SEQ_LENGTH, self.model.max_seq_length or EMBED_MAX_SEQ_LENGTH
             )
 
-            self.model = AutoModel.from_pretrained(
-                self.model_path_or_name,
-                local_files_only=self.is_local,
-                trust_remote_code=True,
-                torch_dtype=self.torch_dtype,
-            )
-        except Exception as e:
-            logging.error(f"[Embeddings] Failed to load model {self.model_path_or_name}: {e}")
-            # Final fallback to standard MiniLM if anything fails
-            if self.model_path_or_name != "sentence-transformers/all-MiniLM-L6-v2":
-                logging.info("[Embeddings] Attempting final fallback to sentence-transformers/all-MiniLM-L6-v2")
-                self.model_path_or_name = "sentence-transformers/all-MiniLM-L6-v2"
-                self.is_local = False
-                self._load_model()
-                return
-            raise e
-
-        self.model.to(self.device)
-        self.model.eval()
-
-        logging.info("[Embeddings] Model loaded and ready.")
+        self.dimension = int(self.model.get_sentence_embedding_dimension())
+        logger.info(
+            "[Embeddings] Ready: dim=%d, max_seq_length=%s, doc_prefix=%r, query_prefix=%r",
+            self.dimension,
+            self.model.max_seq_length,
+            self.doc_prefix,
+            self.query_prefix,
+        )
 
     def embed_documents(
         self,
         texts: List[str],
-        batch_size: int = 16,
-        normalize: bool = True
+        batch_size: Optional[int] = None,
+        normalize: bool = True,
     ) -> List[List[float]]:
-        """
-        Generate embeddings for a list of texts.
-        Processes in batches to avoid OOM on GPU.
-        Returns embeddings as list of lists (CPU, float32).
-        """
-        all_embeddings = []
+        """Embed a list of passages. Returns plain lists so Chroma can store them."""
+        if not texts:
+            return []
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-
-            # Tokenize
-            inputs = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                last_hidden = outputs.last_hidden_state  # [batch, seq, hidden]
-                embeddings = last_hidden.mean(dim=1)     # mean pooling -> [batch, hidden]
-
-                if normalize:
-                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-
-            # Move to CPU and convert to list
-            all_embeddings.extend(embeddings.cpu().tolist())
-
-        logging.info(f"[Embeddings] Generated {len(all_embeddings)} vectors of size {len(all_embeddings[0])}")
-        return all_embeddings
+        prefixed = [f"{self.doc_prefix}{t}" for t in texts]
+        vectors = self.model.encode(
+            prefixed,
+            batch_size=batch_size or self.batch_size,
+            normalize_embeddings=normalize,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        logger.info("[Embeddings] Generated %d vectors of size %d", len(vectors), self.dimension)
+        return [v.tolist() for v in vectors]
 
     def embed_query(self, query: str, normalize: bool = True) -> List[float]:
-        """
-        Generate an embedding for a single query string.
-        Returns a single embedding vector (CPU, float32).
-        """
-        inputs = self.tokenizer(
-            query,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        ).to(self.device)
+        """Embed a single user query, using the query-side prefix."""
+        vector = self.model.encode(
+            f"{self.query_prefix}{query}",
+            normalize_embeddings=normalize,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return vector.tolist()
 
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            last_hidden = outputs.last_hidden_state
-            embedding = last_hidden.mean(dim=1)
-
-            if normalize:
-                embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
-
-        return embedding.cpu().squeeze(0).tolist()
-    
-
-    def cleanup(self):
-        """Release memory to avoid CPU/GPU memory issues."""
-        logging.info("[Embeddings] Cleaning up model and tokenizer...")
-        for attr in ["model", "tokenizer"]:
-            if getattr(self, attr, None) is not None:
-                delattr(self, attr)
+    def cleanup(self) -> None:
+        """Release the model so a long-lived process does not hold the RAM."""
+        logger.info("[Embeddings] Cleaning up %s", self.model_name)
+        self.model = None
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logging.info("[Embeddings] Cleanup completed.")
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass

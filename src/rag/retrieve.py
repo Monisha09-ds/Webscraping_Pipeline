@@ -1,145 +1,80 @@
-# ###--------###
-# # src/rag/retrieves.py
+# src/rag/retrieve.py
 
-# from __future__ import annotations
-# from typing import List, Dict
-# import sys
-# from pathlib import Path
-# import logging
-
-# PROJ_ROOT = Path(__file__).resolve().parents[1]
-# if str(PROJ_ROOT) not in sys.path:
-#     sys.path.insert(0, str(PROJ_ROOT))
-
-# from vectorstore.embeddings import LocalTextEmbedder
-# from vectorstore.store import ChromaStore  
-
-# logger = logging.getLogger(__name__)
-
-# def retrieve_chunks(query: str, store: ChromaStore, embedder: LocalTextEmbedder, top_k: int = 5) -> List[Dict]:
-#     if not query:
-#         raise ValueError("Query cannot be empty")
-
-#     try:
-#         query_embedding = embedder.embed_query(query)
-#         results = store.query(query_embedding, top_k=top_k)
-
-#         if not results:
-#             logger.warning("No chunks retrieved for query=%s", query)
-#             return []
-
-#         # Normalize: always return list of dicts with "text"
-#         norm = []
-#         for r in results:
-#             if isinstance(r, str):
-#                     norm.append({
-#                 "text": r.get("text") or r.get("page_content") or "",
-#                 "title": r.get("metadata", {}).get("title", "Unknown")
-#             })
-
-#             elif isinstance(r, dict):
-#                 norm.append({"text": r.get("text") or r.get("page_content") or ""})
-#             else:
-#                 norm.append({"text": getattr(r, "page_content", "") or ""})
-#         return norm
-#     except Exception as e:
-#         logger.exception("Retrieval failed: %s", e)
-#         raise
-
-
-# # ---------------- Local testing ----------------
-# if __name__ == "__main__":
-    
-#     store_path = Path("/home/aiteam/Desktop/website_content_scrapper/webscraper_pipeline/chroma_store")
-
-#     # Initialize embedder & store
-#     embedder = LocalTextEmbedder() 
-#     store = ChromaStore(persist_dir=store_path)
-
-#     query = "What is deep learning?"
-#     print(f"Query: {query}")
-
-#     try:
-#         results = retrieve_chunks(query, store, embedder, top_k=5)
-#         print("\nTop Results:")
-#         for idx, res in enumerate(results, 1):
-#             print(f"{idx}. {res}")
-#     except Exception as e:
-#         print(f"Error during retrieval: {e}")
-
-
-
-####---------------------------####
-
-# rag/retrieve.py
 from __future__ import annotations
-from typing import List, Dict
+
+import logging
 import sys
 from pathlib import Path
-import logging
+from typing import Dict, List
 
 PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 
+from utils.config import RETRIEVAL_TOP_K
 from vectorstore.embeddings import LocalTextEmbedder
 from vectorstore.store import ChromaStore
 
 logger = logging.getLogger(__name__)
 
+
 def _pick_title(meta: dict | None) -> str:
     meta = meta or {}
-    return (
-        meta.get("title")
-        or meta.get("page_title")
-        or meta.get("section")
-        or meta.get("h_path")
-        or meta.get("source")
-        or "Untitled"
-    )
+    for key in ("title", "page_title", "section", "h_path", "source"):
+        value = meta.get(key)
+        if value:
+            return str(value)
+    return "Untitled"
+
+
+def _extract_meta(result) -> dict:
+    """Chroma results carry `meta`; Document-like objects carry `metadata`."""
+    if isinstance(result, dict):
+        return result.get("meta") or result.get("metadata") or {}
+    return getattr(result, "metadata", None) or {}
+
 
 def retrieve_chunks(
     query: str,
     store: ChromaStore,
     embedder: LocalTextEmbedder,
-    top_k: int = 5
+    top_k: int = RETRIEVAL_TOP_K,
 ) -> List[Dict[str, str]]:
-    """
-    Returns a list of dicts: [{"text": "...", "title": "..."}]
-    """
+    """Returns [{"text": ..., "title": ..., "score": ...}] ordered by relevance."""
     if not query or not query.strip():
         raise ValueError("Query cannot be empty")
 
     try:
-        # If your store has a convenience `search`, use it (it can call embedder inside)
         if hasattr(store, "search"):
             results = store.search(query=query, embedder=embedder, top_k=top_k)
         else:
-            q_emb = embedder.embed_query(query)
-            results = store.query(q_emb, top_k=top_k)
-
-        if not results:
-            logger.warning("No chunks retrieved for query=%s", query)
-            return []
-
-        normalized: List[Dict[str, str]] = []
-        for r in results:
-            # common shapes supported:
-            # - dict: {"text": "...", "metadata": {...}}
-            # - langchain Document-like: has .page_content and .metadata
-            # - bare string: "...."
-            if isinstance(r, dict):
-                text = r.get("text") or r.get("page_content") or ""
-                title = _pick_title(r.get("metadata"))
-            else:
-                text = getattr(r, "text", None) or getattr(r, "page_content", "") or (r if isinstance(r, str) else "")
-                title = _pick_title(getattr(r, "metadata", None))
-
-            text = (text or "").strip()
-            if text:
-                normalized.append({"text": text, "title": title})
-
-        return normalized
+            results = store.query(embedder.embed_query(query), top_k=top_k)
     except Exception as e:
         logger.exception("Retrieval failed: %s", e)
         raise
+
+    if not results:
+        logger.info("No chunks retrieved for query=%r", query)
+        return []
+
+    normalized: List[Dict[str, str]] = []
+    for r in results:
+        if isinstance(r, dict):
+            text = r.get("text") or r.get("page_content") or ""
+            score = r.get("score")
+        elif isinstance(r, str):
+            text, score = r, None
+        else:
+            text = getattr(r, "text", None) or getattr(r, "page_content", "") or ""
+            score = getattr(r, "score", None)
+
+        text = (text or "").strip()
+        if not text:
+            continue
+
+        entry: Dict[str, str] = {"text": text, "title": _pick_title(_extract_meta(r))}
+        if score is not None:
+            entry["score"] = score
+        normalized.append(entry)
+
+    return normalized

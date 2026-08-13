@@ -3,6 +3,7 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 import argparse
 
 # Path bootstrap
@@ -18,8 +19,13 @@ from utils.config import (
     CRAWL_STRATEGY_DEFAULT,
     SITECONTENT_ROOT,
     CHROMA_ROOT,
-    EMBED_MODEL_PATH,
+    COLLECTION_PREFIX,
+    EMBED_MODEL_NAME,
+    GROQ_MODEL,
+    LLM_PROVIDER,
+    collection_for_session,
 )
+from utils.session import session_id_for_folder
 from vectorstore.store import build_from_sitecontent, ChromaStore
 from vectorstore.embeddings import LocalTextEmbedder
 
@@ -78,71 +84,59 @@ def run_crawler(
 def run_ingest(
     site_dir: Path,
     persist_dir: Path,
-    model_path: Path,
-    chunk_tokens: int,
-    chunk_overlap: int,
+    embed_model: str,
     min_chars: int,
+    collection: str,
 ):
     if not site_dir.exists():
         raise ValueError(f"sitecontent not found: {site_dir}")
     if not any(site_dir.rglob("*.md")):
         raise ValueError(f"No .md files under: {site_dir}")
-    if not model_path.exists():
-        raise ValueError(f"Embedding model path not found: {model_path}")
-
-    # smoke test embedder
-    embedder = LocalTextEmbedder(model_path=str(model_path))
-    embedder.embed_documents(["hello world"])
-    log.info("Embedding model tested successfully")
-    embedder.cleanup()
 
     store = build_from_sitecontent(
         site_dir=site_dir,
         persist_dir=persist_dir,
-        embed_model_path=str(model_path),
+        embed_model_path=embed_model,
         min_chars=min_chars,
+        collection=collection,
     )
-    log.info(f"Ingest done. Docs persisted: {store.count()}")
+    log.info(f"Ingest done. Chunks persisted: {store.count()} (collection={collection})")
 
 
-def run_inspect(persist_dir: Path):
-    store = ChromaStore(persist_dir=persist_dir)
-    log.info(f"Docs in DB: {store.count()}")
+def run_inspect(persist_dir: Path, collection: str):
+    store = ChromaStore(persist_dir=persist_dir, collection=collection)
+    log.info(f"Chunks in collection {collection}: {store.count()}")
     log.info(f"Persistence dir: {persist_dir}")
 
 
 # --------- NEW: interactive chat (query) ----------
 def run_chat(
     persist_dir: Path,
-    model_path: Path,
+    collection: str,
+    embed_model: str,
     top_k: int = 3,
-    mode_arg: str | None = None,
+    provider_arg: str | None = None,
     model_name_arg: str | None = None,
 ):
     """
-    Opens a CLI chat after DB is ready. Lets the user pick LLM backend.
+    Opens a CLI chat after DB is ready. Lets the user pick the LLM backend.
     """
     # vector store + embedder
-    store = ChromaStore(persist_dir=persist_dir)
-    embedder = LocalTextEmbedder(model_path=str(model_path), device="cpu")
+    store = ChromaStore(persist_dir=persist_dir, collection=collection)
+    embedder = LocalTextEmbedder(model_path=embed_model)
 
-    # choose LLM mode interactively if not provided
-    mode = mode_arg or ask_choice("Select LLM mode", ["api", "local"], default="api")
-    model_name = model_name_arg
+    provider = provider_arg or ask_choice(
+        "Select LLM provider", ["groq", "local"], default=LLM_PROVIDER
+    )
 
-    if mode == "api":
-        # let user override API model name interactively
-        default_api_model = model_name or "gemini-1.5-flash"
-        user_model = input(
-            f"Gemini model name [default={default_api_model}]: "
-        ).strip() or default_api_model
-        llm = LLMWrapper(mode="api", model_name=user_model)
-        log.info(f"Chat will use Gemini API model: {user_model}")
+    if provider == "groq":
+        default_model = model_name_arg or GROQ_MODEL
+        user_model = input(f"Groq model [default={default_model}]: ").strip() or default_model
+        llm = LLMWrapper(provider="groq", model_name=user_model)
+        log.info(f"Chat will use Groq model: {user_model}")
     else:
-        # local mode: requires a local model folder as per LLMWrapper contract
-        # if you have gemma under models/gemma-3-4b-it, no name override needed
-        log.info("Chat will use local HuggingFace model (gemma-3-4b-it folder expected).")
-        llm = LLMWrapper(mode="local")
+        log.info("Chat will use a local HuggingFace model.")
+        llm = LLMWrapper(provider="local", model_name=model_name_arg)
 
     log.info("Chat mode started. Type 'exit' to quit.")
     while True:
@@ -197,9 +191,12 @@ def main():
         "--sitecontent", type=Path, default=SITECONTENT_ROOT, help="Sitecontent folder"
     )
     parser.add_argument("--persist", type=Path, default=CHROMA_ROOT, help="Chroma persist dir")
-    parser.add_argument("--embed-model", type=Path, default=EMBED_MODEL_PATH, help="Embedding model path")
-    parser.add_argument("--chunk-tokens", type=int, default=450, help="Chunk tokens")
-    parser.add_argument("--chunk-overlap", type=int, default=90, help="Chunk overlap")
+    parser.add_argument(
+        "--embed-model",
+        type=str,
+        default=EMBED_MODEL_NAME,
+        help="Embedding model id or local path",
+    )
     parser.add_argument("--min-chars", type=int, default=80, help="Min chars per file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode for inputs")
 
@@ -207,13 +204,13 @@ def main():
     parser.add_argument("--chat", action="store_true", help="Enter chat mode after pipelines")
     parser.add_argument("--top-k", type=int, default=3, help="Top K chunks for retrieval")
     parser.add_argument(
-        "--llm-mode",
-        choices=["api", "local"],
-        help="Force LLM mode for chat (otherwise asked interactively)",
+        "--llm-provider",
+        choices=["groq", "local"],
+        help="Force the LLM provider for chat (otherwise asked interactively)",
     )
     parser.add_argument(
         "--llm-model-name",
-        help="API model name for --llm-mode=api (e.g., gemini-1.5-flash). If omitted, asked interactively.",
+        help=f"Model name for the chosen provider (e.g. {GROQ_MODEL}).",
     )
 
     args = parser.parse_args()
@@ -243,7 +240,7 @@ def main():
 
     site_dir = args.sitecontent.resolve()
     persist_dir = args.persist.resolve()
-    model_path = args.embed_model.resolve()
+    embed_model = args.embed_model
 
     # Step 1: Crawl
     log.info("Starting crawler...")
@@ -257,21 +254,29 @@ def main():
         same_domain_only,
     )
 
+    # Crawled output lands under sitecontent/<domain>; give that folder its own
+    # collection so a second site never lands in the same namespace.
+    domain = urlparse(url).netloc.replace(".", "-").replace(":", "-")
+    domain_dir = site_dir / domain
+    ingest_dir = domain_dir if domain_dir.exists() else site_dir
+    collection = collection_for_session(session_id_for_folder(ingest_dir))
+
     # Step 2: Ingest
     log.info("Starting ingest...")
-    run_ingest(site_dir, persist_dir, model_path, args.chunk_tokens, args.chunk_overlap, args.min_chars)
+    run_ingest(ingest_dir, persist_dir, embed_model, args.min_chars, collection)
 
     # Step 3: Inspect
     log.info("Starting inspect...")
-    run_inspect(persist_dir)
+    run_inspect(persist_dir, collection)
 
     # Step 4: Chat (RAG)
     if args.chat:
         run_chat(
             persist_dir=persist_dir,
-            model_path=model_path,
+            collection=collection,
+            embed_model=embed_model,
             top_k=args.top_k,
-            mode_arg=args.llm_mode,
+            provider_arg=args.llm_provider,
             model_name_arg=args.llm_model_name,
         )
 
