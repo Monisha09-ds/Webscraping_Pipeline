@@ -1,4 +1,4 @@
-# 🕷️ WebScraper & RAG Pipeline: Intelligent Site Intelligence
+# WebScraper & RAG Pipeline: Intelligent Site Intelligence
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green?logo=fastapi)](https://fastapi.tiangolo.com/)
@@ -11,7 +11,7 @@
 
 ---
 
-## 🌟 Why This Project?
+##  Why This Project?
 
 In the era of LLMs, the most valuable asset is **proprietary data**. This project demonstrates an end-to-end engineering solution to the "Data Ingestion Gap" by:
 1.  **Mining**: Deep recursive scraping of complex site structures.
@@ -21,7 +21,7 @@ In the era of LLMs, the most valuable asset is **proprietary data**. This projec
 
 ---
 
-## 🏗️ Technical Architecture
+## Technical Architecture
 
 The system is built with a modular service-oriented architecture, ensuring scalability and ease of deployment.
 
@@ -40,7 +40,7 @@ graph TD
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 ### 1. Advanced Web Scraper
 - **Recursive Depth Management**: Supports both BFS and DFS strategies with domain-locking.
@@ -57,7 +57,7 @@ graph TD
 
 ---
 
-## 🛠️ Quick Start
+##  Quick Start
 
 ### Option A: Docker Compose (Recommended)
 Launch the entire ecosystem (2 Backends, 2 Frontends) with one command:
@@ -86,7 +86,7 @@ docker-compose up --build
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 ```text
 src/
 ├── scraper/        # Deep crawling & Link frontier logic
@@ -99,9 +99,6 @@ src/
 
 ---
 
-## 📈 Future Roadmap
+##  Future Roadmap
 - [ ] Support for PDF and Docx ingestion in the same pipeline.
-- [ ] Integration with local LLMs (Gemma/Llama) via Docker.
-- [ ] Visual sitemap generation.
-
----
+- [ ] Visual sitemap generation
