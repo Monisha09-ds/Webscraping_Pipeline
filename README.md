@@ -34,7 +34,7 @@ graph TD
     F[User Query] -->|Ask| G(FastAPI Chat Service)
     G -->|Similarity Search| E
     E -->|Context| G
-    G -->|Augmented Prompt| H[Gemini 1.5 Flash]
+    G -->|Augmented Prompt| H[BYOK]
     H -->|Answer| F
 ```
 
