@@ -4,7 +4,6 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green?logo=fastapi)](https://fastapi.tiangolo.com/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.41-red?logo=streamlit)](https://streamlit.io/)
 [![ChromaDB](https://img.shields.io/badge/ChromaDB-1.0-orange)](https://www.trychroma.com/)
-[![Gemini](https://img.shields.io/badge/AI-Gemini_1.5_Flash-purple?logo=google-gemini)](https://deepmind.google/technologies/gemini/)
 [![Docker](https://img.shields.io/badge/Docker-Enabled-blue?logo=docker)](https://www.docker.com/)
 
 **WebScraper & RAG Pipeline** is a sophisticated, full-stack multi-agent system designed to extract high-quality knowledge from any website and transform it into an interactive, context-aware AI Knowledge Base.
